@@ -637,7 +637,7 @@ section{scroll-margin-top:110px}
 
   <footer>
     <div>FX BIAS SCANNER — 定量ロジックによる通貨ペア方向感スキャナー</div>
-    <div class="fin">Data: <a href="https://finance.yahoo.com" rel="noopener">Yahoo Finance</a>（FX・BTC 日足OHLC＋4時間足検証用1h）＋ <a href="https://www.kraken.com" rel="noopener">Kraken</a>（XAU/USD・PAXG代理）＋ <a href="https://frankfurter.dev" rel="noopener">frankfurter.dev</a>（ECB基準レート・カスタムFX用）＋ <a href="https://twelvedata.com" rel="noopener">Twelve Data</a>（FX 5分足・キー入力時）・ 判定エンジン: 内蔵ルールエンジン v2.14（わかりやすい通知文言・Xシェア画像・TP1全量決済の文言整合・C局面・高信頼度シグナル除外・主要6ペア＋XAUの7銘柄・ロジック族10種×ウォークフォワード検証・4時間足検証のうえ日足採用・デイトレ・短期モード（スイングはv2.6で・BTC専用はv2.9で廃止）・ATR高ボラ抑制フィルタ・OHLC約定・スプレッド込み・IS/OOS分離） ・ 入力データはどこにも送信されません。</div>
+    <div class="fin">Data: <a href="https://finance.yahoo.com" rel="noopener">Yahoo Finance</a>（FX・BTC 日足OHLC＋4時間足検証用1h）＋ <a href="https://www.kraken.com" rel="noopener">Kraken</a>（XAU/USD・PAXG代理）＋ <a href="https://frankfurter.dev" rel="noopener">frankfurter.dev</a>（ECB基準レート・カスタムFX用）＋ <a href="https://twelvedata.com" rel="noopener">Twelve Data</a>（FX 5分足・キー入力時）・ 判定エンジン: 内蔵ルールエンジン v2.18（更新ボタンで実勢価格を取得し当日バーを差し替えて再判定〔価格反映は数秒・失敗は表示〕・価格ソースを多重化〔Yahoo→Coinbase自動切替〕で通信制限に強い・Yahoo日足が取れない日はECB終値で判定を最新化・わかりやすい通知文言・Xシェア画像・TP1全量決済の文言整合・C局面・高信頼度シグナル除外・主要6ペア＋XAUの7銘柄・ロジック族10種×ウォークフォワード検証・4時間足検証のうえ日足採用・デイトレ・短期モード（スイングはv2.6で・BTC専用はv2.9で廃止）・ATR高ボラ抑制フィルタ・OHLC約定・スプレッド込み・IS/OOS分離） ・ 入力データはどこにも送信されません。</div>
   </footer>
 
 </main>
@@ -655,7 +655,7 @@ section{scroll-margin-top:110px}
 (function (global) {
   'use strict';
 
-  var VERSION = '2.14';
+  var VERSION = '2.18';
 
   var PAIRS = [
     'XAU/USD',
@@ -2054,10 +2054,132 @@ section{scroll-margin-top:110px}
     });
   }
 
+  /* v2.17: 実勢価格を当日バーへ差し替えて判定を再計算。取得は1リクエスト化（spark・6銘柄同時）でレート制限を回避 */
+  function liveFresh(q) { return !!(q && q.rmt && Date.now() - q.rmt < 15 * 60000); }
+  function mergeQuote(p, q) {
+    var cur = state.livePx && state.livePx[p];
+    state.livePx = state.livePx || {};
+    state.livePx[p] = { px: q.px, t: Date.now(), rmt: q.rmt || Date.now() };
+    return !cur || cur.px !== q.px;
+  }
+  function todayUTC() { return new Date().toISOString().slice(0, 10); }
+  function fetchSparkQuotes() { /* 6銘柄を1リクエストで（個別fetchの6倍→1倍・429対策の主力） */
+    quoteHost = 1 - quoteHost; /* query1/query2を交互に */
+    var syms = Object.keys(TICKSYMS).map(function (p) { return TICKSYMS[p]; }).join(',');
+    return fetchJSON('https://' + (quoteHost ? 'query2' : 'query1') + '.finance.yahoo.com/v8/finance/spark?symbols=' + encodeURIComponent(syms) + '&range=1d&interval=1m', 6000).then(function (j) {
+      var rs = j && j.spark && j.spark.result;
+      if (!rs || !rs.length) throw new Error('bad spark');
+      var out = {};
+      rs.forEach(function (r) {
+        var res = r.response && r.response[0];
+        var px = res && res.meta && res.meta.regularMarketPrice;
+        if (px == null) return;
+        for (var k in TICKSYMS) if (TICKSYMS[k] === r.symbol) out[k] = { px: px, rmt: res.meta.regularMarketTime ? res.meta.regularMarketTime * 1000 : Date.now() };
+      });
+      if (!Object.keys(out).length) throw new Error('empty spark');
+      return out;
+    });
+  }
+  function fetchQuoteXAU() {
+    return fetchJSON('https://api.kraken.com/0/public/Ticker?pair=PAXGUSD', 6000).then(function (j) {
+      var r = j && j.result; var k = r && Object.keys(r)[0];
+      var px = k && r[k].c && parseFloat(r[k].c[0]);
+      if (!px) throw new Error('no px');
+      return { px: px, rmt: Date.now() };
+    });
+  }
+  function fetchCoinbase() { /* v2.18: Yahooが通信制限でも価格を止めない第2系統（Coinbase・1リクエストで全FX・CORS公開・鍵不要。実勢に比べ数分程度の遅延の可能性） */
+    return fetchJSON('https://api.coinbase.com/v2/exchange-rates?currency=USD', 6000).then(function (j) {
+      var r = j && j.data && j.data.rates;
+      if (!r) throw new Error('bad coinbase');
+      var out = {}, inv = { 'EUR/USD': 'EUR', 'GBP/USD': 'GBP', 'AUD/USD': 'AUD' }, dir = { 'USD/JPY': 'JPY', 'USD/CAD': 'CAD', 'USD/CHF': 'CHF' };
+      var now = Date.now();
+      Object.keys(inv).concat(Object.keys(dir)).forEach(function (p) {
+        var v = parseFloat(r[inv[p] || dir[p]]);
+        if (!v || v <= 0) return;
+        out[p] = { px: inv[p] ? 1 / v : v, rmt: now };
+      });
+      if (Object.keys(out).length < 4) throw new Error('thin coinbase');
+      return out;
+    });
+  }
+  function fetchAllQuotes() { /* spark（Yahoo・1リクエスト）→新鮮なものだけ採用→不足分をCoinbaseで補完。XAUはKraken */
+    return Promise.all([fetchSparkQuotes().catch(function () { return {}; }), fetchQuoteXAU().catch(function () { return {}; })]).then(function (rs) {
+      var out = {};
+      Object.keys(rs[0]).forEach(function (p) { if (liveFresh(rs[0][p])) out[p] = rs[0][p]; });
+      for (var k in rs[1]) out[k] = rs[1][k];
+      var miss = 0;
+      Object.keys(TICKSYMS).forEach(function (p) { if (!liveFresh(out[p])) miss++; });
+      if (miss < 2) return out;
+      return fetchCoinbase().then(function (cb) {
+        Object.keys(cb).forEach(function (p) { if (!liveFresh(out[p])) out[p] = cb[p]; });
+        return out;
+      }, function () { return out; });
+    });
+  }
+  function patchSeries() { /* 当日バー（形成中）の終値を実勢価格に差し替え。当日バーが無ければ当日バーを追加（古いバーは絶対に書き換えない） */
+    if (!state.series) return false;
+    var today = todayUTC(), touched = false;
+    Object.keys(TICKSYMS).concat(['XAU/USD']).forEach(function (p) {
+      var q = state.livePx && state.livePx[p];
+      if (!liveFresh(q)) return;
+      var s = state.series[p];
+      if (!s || !s.dates || !s.closes || s.closes.length < 30) return;
+      var i = s.closes.length - 1, dLast = s.dates[i];
+      if (dLast === today) {
+        if (s.closes[i] === q.px) return;
+        s.closes[i] = q.px;
+        if (s.highs && q.px > s.highs[i]) s.highs[i] = q.px;
+        if (s.lows && q.px < s.lows[i]) s.lows[i] = q.px;
+        touched = true;
+      } else if (dLast < today && Date.now() - new Date(dLast + 'T00:00:00Z').getTime() < 7 * 86400000) {
+        s.dates.push(today); s.closes.push(q.px);
+        if (s.highs) s.highs.push(q.px);
+        if (s.lows) s.lows.push(q.px);
+        if (s.opens) s.opens.push(q.px);
+        touched = true;
+      }
+    });
+    return touched;
+  }
+  function recomputeLive() {
+    if (!state.table || !state.series) { try { updateLive(); } catch (e) {} return; }
+    if (!patchSeries()) { try { updateLive(); } catch (e) {} return; }
+    try {
+      state.analyses = E.computeAll(state.table, E.PAIRS, state.series);
+      state.prevVerdicts = computePrevVerdicts();
+      renderAll();
+      renderPairTabs();
+      evaluateAlerts();
+      biasTick();
+      setTimeout(function () { try { updateLive(); } catch (e) {} }, 0); /* 再描画後にもう一度ライブ価格を適用 */
+    } catch (e) { if (window.console) console.error('live recompute failed', e); }
+  }
+
+  /* v2.17: Yahoo日足が古いまま（取得失敗続き）でも、ECB終値テーブルで日次系列を最新化して判定が止まらないようにする（終値のみ・高値安値なし） */
+  function rescueSeries(d) {
+    if (!d.table || !d.table.dates || !d.table.dates.length) return;
+    var tLast = d.table.dates[d.table.dates.length - 1];
+    Object.keys(TICKSYMS).forEach(function (p) {
+      var s = d.series[p];
+      if (s && s.dates && s.dates.length && s.dates[s.dates.length - 1] >= tLast) return;
+      var parts = p.split('/');
+      var t = E.pairCloses(d.table, parts[0], parts[1], {});
+      if (t && t.closes && t.closes.length >= 60) { d.series[p] = t; d.seriesSrc[p] = 'table'; }
+    });
+  }
+
   function applyData(d) {
+    rescueSeries(d);
+    state.seriesBT = JSON.parse(JSON.stringify(d.series)); /* v2.17: バックテスト用の原型（ライブ差し替え前に保存・実績数値を安定させる） */
     state.table = d.table;
     state.source = d.table.source || 'snapshot';
-    state.fetched = d.table.fetched || d.table.dates[d.table.dates.length - 1];
+    var fd = d.table.fetched || d.table.dates[d.table.dates.length - 1];
+    Object.keys(d.series || {}).forEach(function (p2) { /* v2.16.1: 日付ラベルは最も新しいソースに合わせる（ECB終値テーブルは前日まで・Yahoo日足は当日を含む） */
+      var s2 = d.series[p2];
+      if (s2 && s2.dates && s2.dates.length && s2.dates[s2.dates.length - 1] > fd) fd = s2.dates[s2.dates.length - 1];
+    });
+    state.fetched = fd;
     state.series = d.series;
     state.seriesSrc = d.seriesSrc;
     state.analyses = E.computeAll(state.table, E.PAIRS, state.series);
@@ -2069,6 +2191,7 @@ section{scroll-margin-top:110px}
     evaluateAlerts();
     biasTick();
     initBacktest();
+    setTimeout(function () { try { updateLive(); } catch (e) {} }, 0); /* v2.16.1: 再描画後にもう一度ライブ価格を適用 */
   }
 
   /* ---------- scorecard strip (常に見える成績) ---------- */
@@ -2103,46 +2226,55 @@ section{scroll-margin-top:110px}
     var t0 = performance.now(), d = 450;
     (function f(t) { var k = Math.min((t - t0) / d, 1); k = 1 - Math.pow(1 - k, 3); el.textContent = fmt(from + (to - from) * k); if (k < 1) requestAnimationFrame(f); })(t0);
   }
-  function updateLive() { /* v2.10: 90秒ごとの価格更新は数値だけ差し替え（全再描画しない＝軽い） */
+  function updateLive() { /* 価格表示だけ差し替え（全再描画しない＝軽い）。LIVEバッジには実勢価格の時刻を出す */
     var lv = state.livePx && state.livePx[state.current];
     var el = $('vLive'); if (!el) return;
-    if (!lv) { el.hidden = true; return; }
+    if (!lv || !liveFresh(lv)) { el.hidden = true; return; }
     el.hidden = false;
     var prev = parseFloat(el.getAttribute('data-px'));
-    el.innerHTML = '<i class="live-dot"></i>LIVE <b>' + E.formatRate(lv.px) + '</b>';
+    var hhmm = new Date(lv.rmt).toLocaleTimeString('ja-JP', { hour: '2-digit', minute: '2-digit' });
+    el.innerHTML = '<i class="live-dot"></i>LIVE <b>' + E.formatRate(lv.px) + '</b>（' + hhmm + '）';
     el.setAttribute('data-px', lv.px);
     if (!isNaN(prev) && prev !== lv.px) { el.classList.remove('fl-up', 'fl-dn'); void el.offsetWidth; el.classList.add(lv.px > prev ? 'fl-up' : 'fl-dn'); }
     [].forEach.call(document.querySelectorAll('#scanBody tr[data-pair]'), function (tr) {
       var q = state.livePx[tr.getAttribute('data-pair')]; var td = tr.querySelector('.lpx');
       if (q && td) td.textContent = E.formatRate(q.px);
     });
+    /* 詳細ヘッダーの現在レートとプランのエントリー参考値も実勢価格（判定計算と同じ値）に差し替え */
+    var vr = $('vRate'); if (vr) vr.textContent = E.formatRate(lv.px);
+    var ep = $('entryPx'); if (ep) ep.textContent = E.formatRate(lv.px);
   }
 
-  /* v2.9.1: ライブ価格（90秒ポーリング・表示専用。判定計算は日足のまま） */
+  /* v2.16: ライブ価格は判定にも使う（当日バーを実勢価格へ差し替え→再計算）。取得は表示中ペア中心に削減（Yahooレート制限対策・失敗時はバックオフ） */
   var TICKSYMS = { 'EUR/USD': 'EURUSD=X', 'USD/JPY': 'USDJPY=X', 'GBP/USD': 'GBPUSD=X', 'AUD/USD': 'AUDUSD=X', 'USD/CAD': 'USDCAD=X', 'USD/CHF': 'USDCHF=X' };
+  var quoteHost = 0;
   function liveLbl() {
     var lv = state.livePx && state.livePx[state.current];
-    if (lv && Date.now() - lv.t < 10 * 60000) return 'ライブ ' + E.formatRate(lv.px) + '（90秒更新）';
+    if (liveFresh(lv)) return 'ライブ ' + E.formatRate(lv.px) + '（30秒更新）';
     return '日次終値ベース';
   }
   function startTicker() {
     state.livePx = state.livePx || {};
+    var failStreak = 0, skipUntil = 0, lastNudge = 0, lastGold = 0;
     function tick() {
-      var keys = Object.keys(TICKSYMS);
-      Promise.all(keys.map(function (p) {
-        return fetchJSON('https://query1.finance.yahoo.com/v8/finance/chart/' + TICKSYMS[p] + '?interval=5m&range=1d', 6000).then(function (j) {
-          var r = j && j.chart && j.chart.result && j.chart.result[0];
-          var px = r && r.meta && r.meta.regularMarketPrice;
-          if (px != null) state.livePx[p] = { px: px, t: Date.now() };
-        }, function () {});
-      }).concat([fetchJSON('https://api.kraken.com/0/public/Ticker?pair=PAXGUSD', 6000).then(function (j) {
-        var r = j && j.result; var k = r && Object.keys(r)[0];
-        var px = k && r[k].c && parseFloat(r[k].c[0]);
-        if (px) state.livePx['XAU/USD'] = { px: px, t: Date.now() };
-      }, function () {})])).then(function () { try { updateLive(); } catch (e) {} });
+      if (Date.now() < skipUntil) return;
+      var wantGold = state.current === 'XAU/USD' || Date.now() - lastGold > 60000; /* XAUは60秒ごと */
+      fetchAllQuotes().then(function (qs) {
+        var okN = Object.keys(qs).length, changed = false;
+        if (okN) { failStreak = 0; skipUntil = 0; } else { failStreak++; }
+        if (qs['XAU/USD']) lastGold = Date.now();
+        Object.keys(qs).forEach(function (p) { changed = mergeQuote(p, qs[p]) || changed; });
+        if (failStreak >= 2) skipUntil = Date.now() + Math.min(30000 * Math.pow(2, failStreak - 2), 8 * 60000); /* 取得失敗は最大8分までバックオフ */
+        if (changed) recomputeLive(); else updateLive();
+      });
     }
-    tick(); setInterval(function () { if (!document.hidden) tick(); }, 90000);
+    state.nudgeTicker = function () { /* ペア切替時に即取得（20秒に1回まで） */
+      if (Date.now() - lastNudge < 20000) return;
+      lastNudge = Date.now(); tick();
+    };
+    setInterval(function () { if (!document.hidden) tick(); }, 30000);
     document.addEventListener('visibilitychange', function () { if (!document.hidden) tick(); });
+    tick();
   }
 
   function renderScorecard() {
@@ -2173,6 +2305,26 @@ section{scroll-margin-top:110px}
     if (b) { b.textContent = folded ? '展開 ▾' : '収納 ▴'; b.setAttribute('aria-expanded', String(!folded)); }
   }
 
+  /* v2.15: 起動・更新の高速化。①日次データをlocalStorageにキャッシュ→再起動・再訪時は即時描画 ②フル取得は6時間に1回+日替わり検知のみ（30分ごとの重い全再取得を廃止）③ボタンは強制フル更新 */
+  function acceptRefresh(d) {
+    state.lastFull = Date.now();
+    try { localStorage.setItem('fxb_lastfull', String(state.lastFull)); } catch (e) {}
+    try { localStorage.setItem('fxb_dcache', JSON.stringify(d)); } catch (e) {}
+    applyData(d);
+  }
+  function smartRefresh(minMs) {
+    if (state.bt.running) return;
+    var last = state.lastFull || 0;
+    if (last && Date.now() - last < (minMs || 30 * 60000)) return;
+    refreshLive().then(acceptRefresh, function () {});
+  }
+  function cachedPaint() { /* スナップショットより新しい日付のキャッシュがあれば即時描画（待ち時間ゼロ） */
+    try {
+      var c = JSON.parse(localStorage.getItem('fxb_dcache') || 'null');
+      if (c && c.table && c.table.dates && state.table && c.table.dates[c.table.dates.length - 1] > state.table.dates[state.table.dates.length - 1]) applyData(c);
+    } catch (e) {}
+  }
+
   function init() {
     initFold();
     buildPairSelect();
@@ -2180,11 +2332,10 @@ section{scroll-margin-top:110px}
     bindEvents();
     /* v2.6: バックテスト監視タイマー（90秒以上Calc中なら強制解除） */
     setInterval(function () { if (state.bt.running && state.bt.startAt && Date.now() - state.bt.startAt > 90000) { state.bt.running = false; renderBTGlobal(); } }, 10000);
-    /* v2.8: 30分ごとの自動更新（アプリを開いている間の定期チェック・バックテスト中はスキップ） */
-    setInterval(function () {
-      if (state.bt.running) return;
-      try { refreshLive().then(function (d) { applyData(d); }).catch(function () {}); } catch (e) {}
-    }, 1800000);
+    /* v2.15: 自動更新は軽量スケジュール。10分ごとに確認し、フル再取得は最終取得から6時間以上空いたときだけ（日替わりはこの検知で拾う）。タブ復帰時は30分以上空いていれば更新 */
+    try { state.lastFull = Number(localStorage.getItem('fxb_lastfull')) || 0; } catch (e) { state.lastFull = 0; }
+    setInterval(function () { if (!document.hidden) smartRefresh(6 * 3600000); }, 600000);
+    document.addEventListener('visibilitychange', function () { if (!document.hidden) smartRefresh(30 * 60000); });
     initAlerts();
     initShare();
     initTdKey();
@@ -2194,9 +2345,10 @@ section{scroll-margin-top:110px}
       var io = new IntersectionObserver(function (es) { es.forEach(function (e) { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }); }, { rootMargin: '0px 0px -8% 0px' });
       [].forEach.call(document.querySelectorAll('main section, main details'), function (el) { io.observe(el); });
     }
-    // v2.9: 内蔵データで即時描画→ライブ取得は裏で差し替え（取得を待たせない）
-    loadData().then(function (d) { applyData(d); }).catch(fatal);
-    refreshLive().then(function (d) { applyData(d); }).catch(function () {});
+    // v2.9: 内蔵データで即時描画→v2.15: 新しければキャッシュ即描画→フル取得は裏で1回
+    loadData().then(function (d) { applyData(d); cachedPaint(); }).catch(fatal);
+    state.lastFull = state.lastFull || 0;
+    smartRefresh(0);
   }
 
   function fatal() {
@@ -2277,12 +2429,21 @@ section{scroll-margin-top:110px}
     });
     $('refreshBtn').addEventListener('click', function () {
       var btn = this;
-      btn.disabled = true; btn.textContent = '更新中…';
-      refreshLive().then(function (d) {
-        applyData(d); btn.textContent = '更新'; btn.disabled = false;
-      }, function () {
-        btn.textContent = '取得失敗'; setTimeout(function () { btn.textContent = '更新'; btn.disabled = false; }, 2500);
+      btn.disabled = true; btn.textContent = '価格取得中…';
+      /* v2.17: 実勢価格の取得と判定反映だけ待つ（数秒）。日次6年分は裏で更新（ボタンを待たせない）。失敗は隠さない */
+      var total = Object.keys(TICKSYMS).length + 1;
+      fetchAllQuotes().then(function (qs) {
+        var okN = Object.keys(qs).length, ch = false;
+        Object.keys(qs).forEach(function (p) { ch = mergeQuote(p, qs[p]) || ch; });
+        recomputeLive();
+        btn.textContent = !okN ? '取得失敗（通信制限）' : ch ? (okN < total ? '価格反映 ' + okN + '/' + total + ' ✓' : '価格反映 ✓') : '価格は最新';
+        btn.disabled = false;
+        setTimeout(function () { btn.textContent = '更新'; }, 2200);
       });
+      if (!state.fullBusy) {
+        state.fullBusy = true;
+        refreshLive().then(function (d) { acceptRefresh(d); recomputeLive(); }, function () {}).then(function () { state.fullBusy = false; });
+      }
     });
     $('rangeBtns').addEventListener('click', function (e) {
       var b = e.target.closest('button'); if (!b) return;
@@ -2417,7 +2578,7 @@ section{scroll-margin-top:110px}
     var liveCnt = 0;
     E.PAIRS.forEach(function (p) { if (state.seriesSrc[p] === 'live') liveCnt++; });
     var b = $('srcBadge');
-    b.textContent = liveCnt >= 8 ? 'LIVE' : (liveCnt === 0 ? 'SNAPSHOT' : 'MIXED');
+    b.textContent = liveCnt >= 6 ? 'LIVE' : (liveCnt === 0 ? 'SNAPSHOT' : 'MIXED');
     b.className = 'srchip mono ' + (liveCnt > 0 ? 'live' : 'snap');
     var bits = [];
     bits.push('日足OHLC: ' + (liveCnt > 0 ? '取得済み（Yahoo Finance・XAUはKraken/PAXG）' : '内蔵データ'));
@@ -2536,6 +2697,7 @@ section{scroll-margin-top:110px}
 
 
   function renderPair(pair) {
+    if (state.nudgeTicker) { try { state.nudgeTicker(); } catch (e) {} } /* v2.16: ペア切替時に即時取得 */
     if (!state.table) return;
     var changed = state.current !== pair;
     state.current = pair;
@@ -2578,7 +2740,7 @@ section{scroll-margin-top:110px}
     vb.textContent = a.verdict.label;
     vb.className = 'v-badge badge-' + a.verdict.cls;
     $('vConf').innerHTML = '信頼度 ' + a.confidence + '% ・ 局面 ' + gradeChip(a.regime);
-    updateLive();
+    setTimeout(function () { try { updateLive(); } catch (e) {} }, 0); /* v2.16.1: 描画完了後にライブ価格を再適用（再描画で日次終値に戻るのを防ぐ） */
     var pos = ((a.composite + 1) / 2) * 100;
     $('needle').style.left = pos + '%';
     $('vScore').textContent = 'バイアススコア ' + (a.composite >= 0 ? '+' : '') + a.composite.toFixed(2) + '（-1 売り 〜 +1 買い）';
@@ -2664,7 +2826,7 @@ section{scroll-margin-top:110px}
     if (p.plan) {
       var L = p.plan;
       body += '<div class="plan-grid">' +
-        '<div class="pcell"><span class="plbl">エントリー想定（現在値）</span><b class="mono">' + E.formatRate(L.entry) + '</b><span class="psub mono">' + liveLbl() + '</span></div>' +
+        '<div class="pcell"><span class="plbl">エントリー想定（現在値）</span><b class="mono" id="entryPx">' + E.formatRate(L.entry) + '</b><span class="psub mono">' + liveLbl() + '</span></div>' +
         '<div class="pcell sl"><span class="plbl">ストップロス（SL）</span><b class="mono">' + E.formatRate(L.sl) + '</b><span class="psub mono">' + distStr(L.sl - L.entry) + ' / ' + (L.slDist / p.atr).toFixed(1) + '×ATR</span></div>' +
         '<div class="pcell tp1"><span class="plbl">利確1（全量）</span><b class="mono">' + E.formatRate(L.tp1) + '</b><span class="psub mono">' + distStr(L.tp1 - L.entry) + ' / ' + L.rr1.toFixed(2) + 'R</span></div>' +
         '<div class="pcell tp2"><span class="plbl">利確2（残り）</span><b class="mono">' + E.formatRate(L.tp2) + '</b><span class="psub mono">' + distStr(L.tp2 - L.entry) + ' / ' + L.rr2.toFixed(2) + 'R</span></div>' +
@@ -3300,7 +3462,7 @@ section{scroll-margin-top:110px}
     var cached = state.bt.per[pair];
     if (cached && cached.dataKey === btCacheKey()) { renderBTBox(pair); renderRanking(); renderActions(); renderScorecard(); return; }
       var parts = pair.split('/');
-      var s = E.pairCloses(state.table, parts[0], parts[1], state.series);
+      var s = E.pairCloses(state.table, parts[0], parts[1], state.seriesBT || state.series); /* v2.17: BTはライブ差し替え前の原型で計算 */
       if (!s || s.closes.length < 300) {
         el.innerHTML = '<p class="muted pad">' + pair + ' は履歴が300日未満のため検証対象外です（300日以上の銘柄が対象）。</p>';
         return;
@@ -3342,7 +3504,7 @@ section{scroll-margin-top:110px}
       }
       var p = pairs[idx++];
       var parts = p.split('/');
-      var s = E.pairCloses(state.table, parts[0], parts[1], state.series);
+      var s = E.pairCloses(state.table, parts[0], parts[1], state.seriesBT || state.series); /* v2.17: BTはライブ差し替え前の原型で計算 */
       if (s && s.closes.length >= 300) {
         var st = E.backtestPair(s.dates, s.closes, p, (s.highs && s.lows) ? { h: s.highs, l: s.lows, o: s.opens } : null);
         if (st && st.n > 0) {
