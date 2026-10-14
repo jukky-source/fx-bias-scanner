@@ -637,7 +637,7 @@ section{scroll-margin-top:110px}
 
   <footer>
     <div>FX BIAS SCANNER — 定量ロジックによる通貨ペア方向感スキャナー</div>
-    <div class="fin">Data: <a href="https://finance.yahoo.com" rel="noopener">Yahoo Finance</a>（FX・BTC 日足OHLC＋4時間足検証用1h）＋ <a href="https://www.kraken.com" rel="noopener">Kraken</a>（XAU/USD・PAXG代理）＋ <a href="https://frankfurter.dev" rel="noopener">frankfurter.dev</a>（ECB基準レート・カスタムFX用）＋ <a href="https://twelvedata.com" rel="noopener">Twelve Data</a>（FX 5分足・キー入力時）・ 判定エンジン: 内蔵ルールエンジン v2.18（更新ボタンで実勢価格を取得し当日バーを差し替えて再判定〔価格反映は数秒・失敗は表示〕・価格ソースを多重化〔Yahoo→Coinbase自動切替〕で通信制限に強い・Yahoo日足が取れない日はECB終値で判定を最新化・わかりやすい通知文言・Xシェア画像・TP1全量決済の文言整合・C局面・高信頼度シグナル除外・主要6ペア＋XAUの7銘柄・ロジック族10種×ウォークフォワード検証・4時間足検証のうえ日足採用・デイトレ・短期モード（スイングはv2.6で・BTC専用はv2.9で廃止）・ATR高ボラ抑制フィルタ・OHLC約定・スプレッド込み・IS/OOS分離） ・ 入力データはどこにも送信されません。</div>
+    <div class="fin">Data: <a href="https://finance.yahoo.com" rel="noopener">Yahoo Finance</a>（FX・BTC 日足OHLC＋4時間足検証用1h）＋ <a href="https://www.kraken.com" rel="noopener">Kraken</a>（XAU/USD・PAXG代理）＋ <a href="https://frankfurter.dev" rel="noopener">frankfurter.dev</a>（ECB基準レート・カスタムFX用）＋ <a href="https://twelvedata.com" rel="noopener">Twelve Data</a>（FX 5分足・キー入力時）・ 判定エンジン: 内蔵ルールエンジン v2.18.2（更新ボタンで実勢価格を取得し当日バーを差し替えて再判定〔価格反映は数秒・失敗は表示〕・価格ソースを多重化〔Yahoo→Coinbase・ゴールドはKraken→Binance自動切替〕で通信制限に強い・ペア切替時にLIVE表示を正しく付け直し・Yahoo日足が取れない日はECB終値で判定を最新化・わかりやすい通知文言・Xシェア画像・TP1全量決済の文言整合・C局面・高信頼度シグナル除外・主要6ペア＋XAUの7銘柄・ロジック族10種×ウォークフォワード検証・4時間足検証のうえ日足採用・デイトレ・短期モード（スイングはv2.6で・BTC専用はv2.9で廃止）・ATR高ボラ抑制フィルタ・OHLC約定・スプレッド込み・IS/OOS分離） ・ 入力データはどこにも送信されません。</div>
   </footer>
 
 </main>
@@ -655,7 +655,7 @@ section{scroll-margin-top:110px}
 (function (global) {
   'use strict';
 
-  var VERSION = '2.18';
+  var VERSION = '2.18.2';
 
   var PAIRS = [
     'XAU/USD',
@@ -1292,6 +1292,9 @@ section{scroll-margin-top:110px}
     if (volPct != null && volPct > 0.85) confidence -= 8;
     if (!has200) confidence -= 6;
     confidence = Math.round(clamp(confidence, 8, 92));
+    /* v2.18.1: データ欠損で1指標でも非数になった場合、判定全体をNaNに汚染しない（欠損指標は無視して有限値で継続） */
+    if (!isNum(composite)) { composite = 0; if (window.console) console.warn('analyze: composite NaN -> 0', pairLabel); }
+    if (!isNum(confidence)) confidence = 40;
 
     var vKey = composite >= 0.30 ? 'long' : composite >= 0.08 ? 'longish' :
                composite <= -0.30 ? 'short' : composite <= -0.08 ? 'shortish' : 'neutral';
@@ -1592,9 +1595,9 @@ section{scroll-margin-top:110px}
   /* ---------- limit-entry waiting plans (押し目買い・戻り売り) ---------- */
 
   function computeLimitPlans(a) {
-    if (!a || !a.ind || !isNum(a.last)) return null;
+    if (!a || !a.ind || !isNum(a.last)) { if (window.console) console.warn('limitPlans:null', a && a.pair, 'ind?', !!a && !!a.ind, 'last', a && a.last); return null; }
     var atr = a.ind.atr;
-    if (!isNum(atr) || atr <= 0) return null;
+    if (!isNum(atr) || atr <= 0) { if (window.console) console.warn('limitPlans:atr', a.pair, atr, a.ind.atrSrc); return null; }
     var last = a.last, pair = a.pair || '';
     var regime = a.regime;
     var hi63 = a.ind.swingHi63, lo63 = a.ind.swingLo63;
@@ -2001,8 +2004,10 @@ section{scroll-margin-top:110px}
       if (!rows || rows.length < 300) throw new Error('short gold');
       var dates = [], o = [], h = [], l = [], c = [];
       rows.forEach(function (r) {
+        var o1 = parseFloat(r[1]), h1 = parseFloat(r[2]), l1 = parseFloat(r[3]), c1 = parseFloat(r[4]);
+        if (!isFinite(o1) || !isFinite(h1) || !isFinite(l1) || !isFinite(c1) || o1 <= 0 || h1 <= 0 || l1 <= 0 || c1 <= 0) return; /* v2.18.1: 欠損・0バーをスキップ（TR経由で判定全体がNaN化するのを防ぐ） */
         dates.push(new Date(r[0] * 1000).toISOString().slice(0, 10));
-        o.push(r[1]); h.push(r[2]); l.push(r[3]); c.push(r[4]);
+        o.push(o1); h.push(h1); l.push(l1); c.push(c1);
       });
       return { dates: dates, closes: c, highs: h, lows: l, opens: o };
     });
@@ -2080,12 +2085,20 @@ section{scroll-margin-top:110px}
       return out;
     });
   }
-  function fetchQuoteXAU() {
+  function fetchQuoteXAU() { /* v2.18.2: Krakenが失敗したらYahoo PAXG-USDにフォールバック（ゴールドのquoting欠け対策） */
+    quoteHost = 1 - quoteHost;
     return fetchJSON('https://api.kraken.com/0/public/Ticker?pair=PAXGUSD', 6000).then(function (j) {
       var r = j && j.result; var k = r && Object.keys(r)[0];
       var px = k && r[k].c && parseFloat(r[k].c[0]);
       if (!px) throw new Error('no px');
       return { px: px, rmt: Date.now() };
+    }, function () {
+      return fetchJSON('https://' + (quoteHost ? 'query2' : 'query1') + '.finance.yahoo.com/v8/finance/chart/PAXG-USD?interval=1m&range=1d', 6000).then(function (j) {
+        var r = j && j.chart && j.chart.result && j.chart.result[0];
+        var px = r && r.meta && r.meta.regularMarketPrice;
+        if (!px) throw new Error('no px');
+        return { px: px, rmt: r.meta.regularMarketTime ? r.meta.regularMarketTime * 1000 : Date.now() };
+      });
     });
   }
   function fetchCoinbase() { /* v2.18: Yahooが通信制限でも価格を止めない第2系統（Coinbase・1リクエストで全FX・CORS公開・鍵不要。実勢に比べ数分程度の遅延の可能性） */
@@ -2122,7 +2135,7 @@ section{scroll-margin-top:110px}
     var today = todayUTC(), touched = false;
     Object.keys(TICKSYMS).concat(['XAU/USD']).forEach(function (p) {
       var q = state.livePx && state.livePx[p];
-      if (!liveFresh(q)) return;
+      if (!liveFresh(q) || !isFinite(q.px) || q.px <= 0) return;
       var s = state.series[p];
       if (!s || !s.dates || !s.closes || s.closes.length < 30) return;
       var i = s.closes.length - 1, dLast = s.dates[i];
@@ -2170,8 +2183,8 @@ section{scroll-margin-top:110px}
   }
 
   function applyData(d) {
+    state.seriesBT = JSON.parse(JSON.stringify(d.series || {})); /* v2.18.1: BT用の原型はrescue前のOHLC系列（高値安値つき・実績数値の再現性を守る） */
     rescueSeries(d);
-    state.seriesBT = JSON.parse(JSON.stringify(d.series)); /* v2.17: バックテスト用の原型（ライブ差し替え前に保存・実績数値を安定させる） */
     state.table = d.table;
     state.source = d.table.source || 'snapshot';
     var fd = d.table.fetched || d.table.dates[d.table.dates.length - 1];
@@ -2257,7 +2270,7 @@ section{scroll-margin-top:110px}
     state.livePx = state.livePx || {};
     var failStreak = 0, skipUntil = 0, lastNudge = 0, lastGold = 0;
     function tick() {
-      if (Date.now() < skipUntil) return;
+      if (Date.now() < skipUntil) { try { updateLive(); } catch (eS) {} return; } /* v2.18.2: スキップ中も鮮度チェック（古いLIVEは隠す） */
       var wantGold = state.current === 'XAU/USD' || Date.now() - lastGold > 60000; /* XAUは60秒ごと */
       fetchAllQuotes().then(function (qs) {
         var okN = Object.keys(qs).length, changed = false;
@@ -2536,7 +2549,7 @@ section{scroll-margin-top:110px}
         var sc = Math.abs(a.composite) * (0.5 + a.confidence / 100) * (wr != null ? 0.7 + wr : 1.0);
         mk.push({ a: a, L: pl.plan, wr: wr, sc: sc, p: p });
       }
-      var lp = E.computeLimitPlans(a);
+      var lp = E.computeLimitPlans(a) || { buy: { valid: false }, sell: { valid: false } }; /* v2.18.1: 指値プランが作れないデータでも落ちない */
       ['buy', 'sell'].forEach(function (d) {
         var w = lp[d];
         if (!w.valid) return;
@@ -2701,6 +2714,7 @@ section{scroll-margin-top:110px}
     if (!state.table) return;
     var changed = state.current !== pair;
     state.current = pair;
+    var vlv0 = $('vLive'); if (vlv0) vlv0.hidden = true; /* v2.18.2: 切替直前のペアのLIVE価格を即隠す（誤表示の持ち越し禁止） */
     try { localStorage.setItem('fxb_pair', pair); } catch (eP) {}
     renderPairTabs();
     if (changed) animPop($('analysis'));
@@ -2740,7 +2754,8 @@ section{scroll-margin-top:110px}
     vb.textContent = a.verdict.label;
     vb.className = 'v-badge badge-' + a.verdict.cls;
     $('vConf').innerHTML = '信頼度 ' + a.confidence + '% ・ 局面 ' + gradeChip(a.regime);
-    setTimeout(function () { try { updateLive(); } catch (e) {} }, 0); /* v2.16.1: 描画完了後にライブ価格を再適用（再描画で日次終値に戻るのを防ぐ） */
+    try { updateLive(); } catch (eL) {} /* v2.18.2: 同期で即適用（切替直後から正しいペアのLIVEのみ出す） */
+    setTimeout(function () { try { updateLive(); } catch (e) {} }, 0); /* 描画完了後にもう一度（再描画で日次終値に戻るのを防ぐ） */
     var pos = ((a.composite + 1) / 2) * 100;
     $('needle').style.left = pos + '%';
     $('vScore').textContent = 'バイアススコア ' + (a.composite >= 0 ? '+' : '') + a.composite.toFixed(2) + '（-1 売り 〜 +1 買い）';
