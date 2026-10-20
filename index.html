@@ -533,6 +533,11 @@ section{scroll-margin-top:110px}
 
 
 
+  <section id="gold">
+    <h2>GOLD 専用 <span class="mono" style="font-size:11px;color:var(--teal)">凍結検証済み</span></h2>
+    <p class="sec-sub">XAU/USD専用ロジック（バンド戻り）。全銘柄共通エンジンとは別枠で運用・2026年OOS一発検証済み。</p>
+    <div class="card pad" id="goldPanel">計算中…</div>
+  </section>
   <section id="alerts">
     <div class="sec-head"><h2>アラート・通知</h2><span class="sub">条件達成・反転を通知（30分毎チェック・端末内完結）</span></div>
     <div class="alert-banner" id="alertBanner" hidden></div>
@@ -655,7 +660,7 @@ section{scroll-margin-top:110px}
 (function (global) {
   'use strict';
 
-  var VERSION = '2.18.2';
+  var VERSION = '2.19';
 
   var PAIRS = [
     'XAU/USD',
@@ -1872,6 +1877,42 @@ section{scroll-margin-top:110px}
     return res;
   }
 
+  /* ---------- v2.19: GOLD専用ロジック（バンド戻り・凍結パラメータ） ----------
+     事前登録プロトコル: Kraken PAXG日足720本・IS=2025年で4候補探索→選択規則(IS n>=12でPF最大)によりバンド戻りを選出→OOS=2026年を一発検証。
+     検証値（凍結・再パラメータ化禁止）: IS n=23 実勝率48% 平均+0.70R PF2.34 DD6.0R ／ OOS n=17 実勝率35% 平均+0.54R PF1.95 DD3.0R
+     ルール（終値のみで判定・ハーネスと完全同一）: SMA20±2σバンド外側で反対売買・SL=1.5×ATRc14・利確はSMA20復帰・時間切れ8日・SL優先 */
+  var GOLD_CFG = { n: 20, band: 2, atrN: 14, slK: 1.5, T: 8 };
+  var GOLD_NOTE = '検証: 2025年(探索) n=23・実勝率48%・平均+0.70R・PF2.34 ／ 2026年(一発検証) n=17・実勝率35%・平均+0.54R・PF1.95・最大DD 3.0R';
+  function analyzeGold(dates, closes) {
+    var c = closes, N = c.length, n = GOLD_CFG.n;
+    function gS(i, k) { if (i < k - 1) return null; var s = 0; for (var q = i - k + 1; q <= i; q++) s += c[q]; return s / k; }
+    function gSd(i, k, m) { if (i < k - 1) return null; var s = 0; for (var q = i - k + 1; q <= i; q++) { var dd = c[q] - m; s += dd * dd; } return Math.sqrt(s / k); }
+    function gAtr(i) { if (i < GOLD_CFG.atrN) return null; var s = 0; for (var q = i - GOLD_CFG.atrN + 1; q <= i; q++) s += Math.abs(c[q] - c[q - 1]); return s / GOLD_CFG.atrN; }
+    var t = N - 1, m = gS(t, n), sd = gSd(t, n, m);
+    if (m == null || sd == null || !isNum(c[t])) return null;
+    var atr = gAtr(t), st = 'flat', dir = 0, entry = null, sl = null, tIn = -1, exitRef = null;
+    for (var i = n + 2; i < N; i++) {
+      var mm = gS(i, n), ssd = gSd(i, n, mm);
+      if (mm == null || ssd == null) continue;
+      if (st === 'hold') {
+        var slHit = dir > 0 ? c[i] <= sl : c[i] >= sl;
+        var exitHit = dir > 0 ? c[i] >= exitRef : c[i] <= exitRef;
+        if (slHit || exitHit || i - tIn >= GOLD_CFG.T) st = 'flat';
+      }
+      if (st === 'flat') {
+        var lo = mm - GOLD_CFG.band * ssd, hi = mm + GOLD_CFG.band * ssd;
+        if (c[i] < lo) { dir = 1; entry = c[i]; sl = c[i] - GOLD_CFG.slK * (gAtr(i) || 0); exitRef = mm; tIn = i; st = 'hold'; }
+        else if (c[i] > hi) { dir = -1; entry = c[i]; sl = c[i] + GOLD_CFG.slK * (gAtr(i) || 0); exitRef = mm; tIn = i; st = 'hold'; }
+      }
+    }
+    var liveLo = m - GOLD_CFG.band * sd, liveHi = m + GOLD_CFG.band * sd;
+    var state;
+    if (st === 'hold') state = dir > 0 ? 'long-hold' : 'short-hold';
+    else state = c[t] < liveLo ? 'signal-buy' : c[t] > liveHi ? 'signal-sell' : 'flat';
+    return { state: state, dir: dir, entry: entry, sl: sl, exitRef: exitRef, daysIn: st === 'hold' ? t - tIn : null,
+      atr: atr, mid: m, sd: sd, lo: liveLo, hi: liveHi, last: c[t], lastDate: dates[t], cfg: GOLD_CFG, note: GOLD_NOTE };
+  }
+
   var api = {
     VERSION: VERSION,
     PAIRS: PAIRS,
@@ -1892,6 +1933,7 @@ section{scroll-margin-top:110px}
     SPREAD: SPREAD,
     OOS_START: OOS_START,
     computeAll: computeAll,
+    analyzeGold: analyzeGold, GOLD_CFG: GOLD_CFG, GOLD_NOTE: GOLD_NOTE,
     pairCloses: pairCloses,
     currencyStrength: currencyStrength,
     normalizeFrankfurter: normalizeFrankfurter,
@@ -2516,11 +2558,34 @@ section{scroll-margin-top:110px}
 
   /* ---------- renders ---------- */
 
+  /* v2.19: GOLD専用パネル（バンド戻り・凍結パラメータ）。全銘柄共通ロジックとは別枠で表示 */
+  var GOLD_VERIFIED = '検証実績（凍結・再パラメータ化禁止）: 2025年(探索) n=23・実勝率48%・平均<b>+0.70R</b>・PF2.34 ／ 2026年(一発検証) n=17・実勝率35%・平均<b>+0.54R</b>・PF1.95・最大DD 3.0R';
+  function renderGoldPanel() {
+    var el = $('goldPanel'); if (!el) return;
+    var s = state.series && state.series['XAU/USD'];
+    if (!s || !s.dates || !s.closes || s.closes.length < 40) { el.innerHTML = '<p class="muted pad">ゴールドのデータが不足しています（「更新」をお試しください）。</p>'; return; }
+    var g = E.analyzeGold(s.dates, s.closes);
+    if (!g) { el.innerHTML = '<p class="muted pad">ゴールド専用判定を計算できませんでした。</p>'; return; }
+    var f2 = function (v) { return v == null ? '—' : v.toFixed(2); };
+    var st, cls = 'neu';
+    if (g.state === 'long-hold') { cls = 'up'; st = '▲ 保有圏（買）' + f2(g.entry) + '保有中 → 戻り ' + f2(g.exitRef) + ' で利確（' + (g.daysIn + 1) + '日目/8）'; }
+    else if (g.state === 'short-hold') { cls = 'dn'; st = '▼ 保有圏（売）' + f2(g.entry) + '保有中 → 戻り ' + f2(g.exitRef) + ' で利確（' + (g.daysIn + 1) + '日目/8）'; }
+    else if (g.state === 'signal-buy') { cls = 'up'; st = '▲ 買いシグナル点灯（下バンド到達）— SL ' + f2(g.last - g.cfg.slK * g.atr) + ' → SMA20 ' + f2(g.mid) + ' 復帰で利確'; }
+    else if (g.state === 'signal-sell') { cls = 'dn'; st = '▼ 売りシグナル点灯（上バンド到達）— SL ' + f2(g.last + g.cfg.slK * g.atr) + ' → SMA20 ' + f2(g.mid) + ' 復帰で利確'; }
+    else st = '― 待ち（±2σバンド外まで不発）';
+    var px = (state.livePx && state.livePx['XAU/USD'] && liveFresh(state.livePx['XAU/USD'])) ? state.livePx['XAU/USD'].px : g.last;
+    el.innerHTML = '<p style="margin:0 0 6px"><span class="sig ' + (cls === 'up' ? 's-long' : cls === 'dn' ? 's-short' : 's-neu') + '">' + st + '</span></p>' +
+      '<p class="mono" style="font-size:11.5px;color:var(--muted);margin:0 0 4px">現在 ' + f2(px) + ' ・ バンド ' + f2(g.lo) + '〜' + f2(g.hi) + ' ・ SMA20 ' + f2(g.mid) + ' ・ ATRc ' + f2(g.atr) + ' ・ 基準日 ' + g.lastDate + '</p>' +
+      '<p class="mono" style="font-size:11px;color:var(--muted);margin:0 0 2px">' + GOLD_VERIFIED + '</p>' +
+      '<p class="mono" style="font-size:10.5px;color:var(--faint);margin:0">ルール: SMA20±2σ外側で逆張り・SL1.5×ATRc14・SMA20復帰で利確・8日で時間切れ（終値基準・SL優先）。損小利大型: 勝率は低いが1勝の見返りが大きい。</p>';
+  }
+
   function renderAll() {
     renderHeader();
     var safe = function (f) { try { f(); } catch (e) { if (window.console) console.error('render error', e); } };
     safe(renderCounts);
     safe(renderActions);
+    safe(renderGoldPanel);
     safe(renderScanner);
     safe(renderScorecard);
     safe(function () { renderPair(state.current); });
